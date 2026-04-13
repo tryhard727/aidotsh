@@ -1,0 +1,117 @@
+#!/bin/bash
+
+# Gemini API key must be exported in your shell config (e.g., .zshrc/.bashrc):
+export GEMINI_API_KEY=""
+
+# --- CONFIGURATION ---
+# Current stable fast model. Alternatively use "gemini-2.0-flash-exp" for latest experimental.
+MODEL="gemini-2.5-flash"
+API_URL="https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent"
+MEMORY_FILE="convo.json"
+
+# --- ARGUMENT PARSING ---
+MODE="default"
+if [[ "$1" == "memory" || "$1" == "code" ]]; then
+    MODE="$1"
+    shift # Remove the keyword from arguments so only the prompt remains
+fi
+
+# --- INPUT HANDLING (Fixes the pipe + args issue) ---
+# 1. Read command line arguments (if any)
+PROMPT_ARGS="$*"
+
+# 2. Read piped input (if any)
+PIPED_INPUT=""
+if [ -p /dev/stdin ]; then
+    PIPED_INPUT="$(cat -)"
+fi
+
+# 3. Combine them
+# If we have both, we separate them with a newline for clarity
+if [[ -n "$PROMPT_ARGS" && -n "$PIPED_INPUT" ]]; then
+    FULL_PROMPT="$PROMPT_ARGS
+
+$PIPED_INPUT"
+elif [[ -n "$PIPED_INPUT" ]]; then
+    FULL_PROMPT="$PIPED_INPUT"
+else
+    FULL_PROMPT="$PROMPT_ARGS"
+fi
+
+# --- MODE: MEMORY (Interactive) ---
+if [ "$MODE" == "memory" ]; then
+    [ ! -f "$MEMORY_FILE" ] && echo '{"contents":[]}' > "$MEMORY_FILE"
+    echo "=== Gemini CLI (Memory Mode: $MODEL) ==="
+    echo "Type 'exit' to quit."
+
+    # If the user piped data into memory mode, handle it as the first message
+    if [ -n "$FULL_PROMPT" ]; then
+        echo "You (Piped): [Data loaded...]"
+        tmp=$(jq --arg text "$FULL_PROMPT" '.contents += [{"role": "user", "parts":[{"text":$text}]}]' "$MEMORY_FILE")
+        echo "$tmp" > "$MEMORY_FILE"
+
+        response=$(curl -s "$API_URL?key=$GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @"$MEMORY_FILE" \
+            | jq -r '.candidates[0].content.parts[0].text')
+
+        echo "Gemini: $response"
+        tmp=$(jq --arg text "$response" '.contents += [{"role": "model", "parts":[{"text":$text}]}]' "$MEMORY_FILE")
+        echo "$tmp" > "$MEMORY_FILE"
+    fi
+
+    while true; do
+        read -p "You: " user_input
+        [[ "$user_input" == "exit" || -z "$user_input" ]] && break
+
+        tmp=$(jq --arg text "$user_input" '.contents += [{"role": "user", "parts":[{"text":$text}]}]' "$MEMORY_FILE")
+        echo "$tmp" > "$MEMORY_FILE"
+
+        response=$(curl -s "$API_URL?key=$GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @"$MEMORY_FILE" \
+            | jq -r '.candidates[0].content.parts[0].text')
+
+        echo "Gemini: $response"
+
+        # Save model response to history
+        tmp=$(jq --arg text "$response" '.contents += [{"role": "model", "parts":[{"text":$text}]}]' "$MEMORY_FILE")
+        echo "$tmp" > "$MEMORY_FILE"
+    done
+    exit 0
+fi
+
+# --- MODE: CODE (Stateless, clean output for Editors) ---
+if [ "$MODE" == "code" ]; then
+    # We prepend a system instruction to force code-only output
+    # We ask it NOT to use markdown blocks, but we also strip them later just in case.
+    SYSTEM_INSTRUCTION="You are a coding assistant. Output ONLY the raw code requested. Do not wrap in markdown code blocks (no \`\`\`). Do not add explanations or conversation. If the input is code, output the modified code only."
+
+    FINAL_TEXT="$SYSTEM_INSTRUCTION
+
+User Request: $FULL_PROMPT"
+
+    # Build JSON
+    json=$(jq -n --arg text "$FINAL_TEXT" '{contents:[{parts:[{text:$text}]}]}')
+
+    # Call Gemini
+    response=$(curl -s "$API_URL?key=$GEMINI_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "$json" \
+        | jq -r '.candidates[0].content.parts[0].text')
+
+    # CLEANUP: Remove markdown code fences if the model ignored instructions
+    # This removes lines starting with ```
+    echo "$response" | sed '/^```/d'
+    exit 0
+fi
+
+# --- MODE: DEFAULT (Stateless, standard output) ---
+[ -z "$FULL_PROMPT" ] && { echo "Usage: gemini [code|memory] <prompt> OR cat file | gemini [code|memory] <prompt>"; exit 1; }
+
+json=$(jq -n --arg text "$FULL_PROMPT" '{contents:[{parts:[{text:$text}]}]}')
+
+curl -s "$API_URL?key=$GEMINI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$json" \
+    | jq -r '.candidates[0].content.parts[0].text'
